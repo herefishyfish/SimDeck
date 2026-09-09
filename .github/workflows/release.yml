@@ -6,6 +6,15 @@
 #   - npm packages publish over OIDC trusted publishing (no NPM_TOKEN).
 #   - The VS Code extension publishes via vsce + VSCE_PAT (no OIDC option).
 #
+# Jobs:
+#   prepare        Resolves package metadata, bumps the version, commits + tags,
+#                  and pushes. Runs first so every native binary is built from
+#                  the bumped commit (the CLI bakes in CARGO_PKG_VERSION).
+#   build-windows  Builds build/simdeck-bin-win32-x64.exe on windows-latest and
+#                  uploads it. Skipped for every package except the root CLI.
+#   release        Builds the macOS binaries, signs + notarizes them, pulls in
+#                  the Windows artifact, and publishes.
+#
 # OIDC setup (do once per npm package on npmjs.com):
 #   Package -> Settings -> Trusted Publishers -> GitHub Actions
 #     Repository:     <owner>/SimDeck
@@ -77,11 +86,21 @@ permissions:
   id-token: write # OIDC trusted publishing + npm provenance
 
 jobs:
-  release:
-    name: Release ${{ inputs.package }} (${{ inputs.bump }})
-    runs-on: macos-latest
-    environment:
-      name: ${{ inputs.dry-run && 'npm-publish-dry-run' || 'npm-publish' }}
+  # The version bump has to happen before any binary is built: the CLI declares
+  # `#[command(version)]`, so the version is baked into every native binary from
+  # Cargo.toml. Bumping here and having the build jobs check out the resulting
+  # commit keeps the macOS and Windows binaries reporting the same version.
+  prepare:
+    name: Prepare ${{ inputs.package }} (${{ inputs.bump }})
+    runs-on: ubuntu-latest
+    outputs:
+      dir: ${{ steps.meta.outputs.dir }}
+      slug: ${{ steps.meta.outputs.slug }}
+      kind: ${{ steps.meta.outputs.kind }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      dist_tag: ${{ steps.tag.outputs.dist_tag }}
+      sha: ${{ steps.commit.outputs.sha || github.sha }}
 
     steps:
       - name: Harden the runner (audit egress)
@@ -98,18 +117,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            packages/client/package-lock.json
-            packages/react-native-inspector/package-lock.json
-            packages/nativescript-inspector/package-lock.json
-
-      - name: Update npm (required for OIDC trusted publishing)
-        run: |
-          npm install -g npm@^11.5.1
-          npm --version
 
       - name: Resolve package metadata
         id: meta
@@ -151,23 +158,6 @@ jobs:
       - name: Setup Rust toolchain (root simdeck only)
         if: ${{ steps.meta.outputs.kind == 'npm-cli' }}
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      - name: Install native build dependencies
-        if: ${{ steps.meta.outputs.kind == 'npm-cli' }}
-        run: brew install pkg-config x264
-
-      - name: Install root dependencies
-        run: npm ci
-
-      - name: Install client dependencies (root simdeck only)
-        if: ${{ steps.meta.outputs.kind == 'npm-cli' }}
-        run: npm ci --prefix packages/client
-
-      - name: Install package dependencies
-        if: ${{ steps.meta.outputs.kind == 'npm' }}
-        run: npm ci --prefix "${{ steps.meta.outputs.dir }}"
 
       - name: Configure git author
         run: |
@@ -235,6 +225,7 @@ jobs:
           echo "dist_tag=${value}" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push version bump
+        id: commit
         if: ${{ !inputs.dry-run }}
         shell: bash
         env:
@@ -248,6 +239,7 @@ jobs:
           if [[ "$BUMP" == "current" ]]; then
             git tag -f "${TAG}"
             git push --force origin "${TAG}"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -262,11 +254,178 @@ jobs:
           git tag "${TAG}"
           git push origin HEAD:${{ github.ref_name }}
           git push origin "${TAG}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # A dry run never pushes, so the build jobs would otherwise check out the
+      # pre-bump commit and build the previous version. Carry the bump across as
+      # a patch so dry runs still exercise the real version end to end.
+      - name: Capture version bump patch (dry-run)
+        if: ${{ inputs.dry-run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff > "${RUNNER_TEMP}/version-bump.patch"
+          cat "${RUNNER_TEMP}/version-bump.patch"
+
+      - name: Upload version bump patch (dry-run)
+        if: ${{ inputs.dry-run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: version-bump-patch
+          path: ${{ runner.temp }}/version-bump.patch
+          if-no-files-found: ignore
+
+  # Windows is a supported target (see the integration-android matrix in ci.yml),
+  # and package.json ships build/simdeck-bin-win32-x64.exe, but nothing built it
+  # until now, so npm published a macOS-only tarball under `os: [darwin, linux,
+  # win32]`. Build it here and hand it to the publish job.
+  build-windows:
+    name: Build Windows binary (win32-x64)
+    needs: prepare
+    if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download version bump patch (dry-run)
+        if: ${{ inputs.dry-run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: version-bump-patch
+          path: ${{ runner.temp }}/bump
+
+      - name: Apply version bump (dry-run)
+        if: ${{ inputs.dry-run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch_file="${RUNNER_TEMP}/bump/version-bump.patch"
+          if [[ -s "$patch_file" ]]; then
+            git apply "$patch_file"
+          fi
+
+      - name: Install root dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build simdeck Windows binary
+        run: npm run build:cli
+
+      - name: Verify Windows artifact is a PE executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build/simdeck-bin-win32-x64.exe
+          header="$(head -c 2 build/simdeck-bin-win32-x64.exe)"
+          if [[ "$header" != "MZ" ]]; then
+            echo "build/simdeck-bin-win32-x64.exe is not a PE executable (header: ${header})" >&2
+            exit 1
+          fi
+          ./build/simdeck-bin-win32-x64.exe --version
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: simdeck-bin-win32-x64
+          path: build/simdeck-bin-win32-x64.exe
+          if-no-files-found: error
+
+  release:
+    name: Release ${{ inputs.package }} (${{ inputs.bump }})
+    needs:
+      - prepare
+      - build-windows
+    # build-windows is skipped for every package except the root simdeck CLI.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.build-windows.result != 'failure' }}
+    runs-on: macos-latest
+    environment:
+      name: ${{ inputs.dry-run && 'npm-publish-dry-run' || 'npm-publish' }}
+
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d # v2.16.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            packages/client/package-lock.json
+            packages/react-native-inspector/package-lock.json
+            packages/nativescript-inspector/package-lock.json
+
+      - name: Update npm (required for OIDC trusted publishing)
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
+      # A dry run never pushed the bump, so replay it here before installing.
+      - name: Download version bump patch (dry-run)
+        if: ${{ inputs.dry-run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: version-bump-patch
+          path: ${{ runner.temp }}/bump
+
+      - name: Apply version bump (dry-run)
+        if: ${{ inputs.dry-run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch_file="${RUNNER_TEMP}/bump/version-bump.patch"
+          if [[ -s "$patch_file" ]]; then
+            git apply "$patch_file"
+          fi
+
+      - name: Setup Rust toolchain (root simdeck only)
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install native build dependencies
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
+        run: brew install pkg-config x264
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install client dependencies (root simdeck only)
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
+        run: npm ci --prefix packages/client
+
+      - name: Install package dependencies
+        if: ${{ needs.prepare.outputs.kind == 'npm' }}
+        run: npm ci --prefix "${{ needs.prepare.outputs.dir }}"
 
       # ---------- Build (kind-specific) ----------
 
       - name: Build root simdeck (macOS arm64+x64 binaries + client + simdeck-test)
-        if: ${{ steps.meta.outputs.kind == 'npm-cli' }}
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
         run: |
           SIMDECK_BUILD_TARGET=aarch64-apple-darwin npm run build:cli
           cp build/simdeck-bin build/simdeck-bin-darwin-arm64
@@ -283,7 +442,7 @@ jobs:
           npm run build:simdeck-test
 
       - name: Verify CLI artifacts are macOS arm64+x64 binaries
-        if: ${{ steps.meta.outputs.kind == 'npm-cli' }}
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
         run: |
           test -x build/simdeck-bin
           test -x build/simdeck-bin-darwin-arm64
@@ -294,10 +453,25 @@ jobs:
           file build/simdeck-bin-darwin-arm64 | grep -q 'arm64'
           file build/simdeck-bin-darwin-x64 | grep -q 'x86_64'
 
+      # Downloaded after the macOS build so the build step cannot clobber it.
+      - name: Download Windows binary
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: simdeck-bin-win32-x64
+          path: build
+
+      - name: Verify Windows artifact is present
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
+        run: |
+          test -f build/simdeck-bin-win32-x64.exe
+          file build/simdeck-bin-win32-x64.exe
+          file build/simdeck-bin-win32-x64.exe | grep -q 'PE32+'
+
       # ---------- Apple codesign + notarize (root simdeck only) ----------
 
       - name: Detect Apple signing capability
-        if: ${{ steps.meta.outputs.kind == 'npm-cli' }}
+        if: ${{ needs.prepare.outputs.kind == 'npm-cli' }}
         id: signing
         shell: bash
         env:
@@ -470,23 +644,23 @@ jobs:
             "$RUNNER_TEMP/notary-result.json" || true
 
       - name: Build npm package
-        if: ${{ steps.meta.outputs.kind == 'npm' }}
-        run: npm --prefix "${{ steps.meta.outputs.dir }}" run build
+        if: ${{ needs.prepare.outputs.kind == 'npm' }}
+        run: npm --prefix "${{ needs.prepare.outputs.dir }}" run build
 
       - name: Package VS Code extension
-        if: ${{ steps.meta.outputs.kind == 'vsce' }}
+        if: ${{ needs.prepare.outputs.kind == 'vsce' }}
         run: npm run package:vscode-extension
 
       # ---------- Publish (npm OIDC) ----------
 
       - name: Publish to npm (OIDC, dry-run)
-        if: ${{ inputs.dry-run && (steps.meta.outputs.kind == 'npm' || steps.meta.outputs.kind == 'npm-cli') }}
+        if: ${{ inputs.dry-run && (needs.prepare.outputs.kind == 'npm' || needs.prepare.outputs.kind == 'npm-cli') }}
         shell: bash
         env:
           NPM_CONFIG_PROVENANCE: "true"
           NODE_AUTH_TOKEN: ""
-          DIST_TAG: ${{ steps.tag.outputs.dist_tag }}
-          PKG_DIR: ${{ steps.meta.outputs.dir }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          PKG_DIR: ${{ needs.prepare.outputs.dir }}
         run: |
           set -euo pipefail
           unset NODE_AUTH_TOKEN
@@ -498,13 +672,13 @@ jobs:
           npm publish --ignore-scripts --provenance --access public --tag "$DIST_TAG" --dry-run
 
       - name: Publish to npm (OIDC)
-        if: ${{ !inputs.dry-run && (steps.meta.outputs.kind == 'npm' || steps.meta.outputs.kind == 'npm-cli') }}
+        if: ${{ !inputs.dry-run && (needs.prepare.outputs.kind == 'npm' || needs.prepare.outputs.kind == 'npm-cli') }}
         shell: bash
         env:
           NPM_CONFIG_PROVENANCE: "true"
           NODE_AUTH_TOKEN: ""
-          DIST_TAG: ${{ steps.tag.outputs.dist_tag }}
-          PKG_DIR: ${{ steps.meta.outputs.dir }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          PKG_DIR: ${{ needs.prepare.outputs.dir }}
         run: |
           set -euo pipefail
           unset NODE_AUTH_TOKEN
@@ -518,13 +692,13 @@ jobs:
       # ---------- Publish (VS Code Marketplace) ----------
 
       - name: Publish VS Code extension (dry-run)
-        if: ${{ inputs.dry-run && steps.meta.outputs.kind == 'vsce' }}
+        if: ${{ inputs.dry-run && needs.prepare.outputs.kind == 'vsce' }}
         run: |
           ls -la build/vscode/
           echo "[dry-run] would: vsce publish --packagePath build/vscode/simdeck-vscode.vsix"
 
       - name: Publish VS Code extension
-        if: ${{ !inputs.dry-run && steps.meta.outputs.kind == 'vsce' }}
+        if: ${{ !inputs.dry-run && needs.prepare.outputs.kind == 'vsce' }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
@@ -543,11 +717,11 @@ jobs:
         if: ${{ !inputs.dry-run }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
           INPUT_PACKAGE: ${{ inputs.package }}
-          NEW_VERSION: ${{ steps.version.outputs.version }}
-          DIST_TAG: ${{ steps.tag.outputs.dist_tag }}
-          KIND: ${{ steps.meta.outputs.kind }}
+          NEW_VERSION: ${{ needs.prepare.outputs.version }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          KIND: ${{ needs.prepare.outputs.kind }}
           BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
@@ -557,6 +731,7 @@ jobs:
           case "$KIND" in
             npm-cli)
               assets+=("build/simdeck-bin")
+              assets+=("build/simdeck-bin-win32-x64.exe")
               ;;
             vsce)
               assets+=("build/vscode/simdeck-vscode.vsix")
@@ -579,9 +754,9 @@ jobs:
         env:
           PKG: ${{ inputs.package }}
           BUMP: ${{ inputs.bump }}
-          NEW: ${{ steps.version.outputs.version }}
-          TAG: ${{ steps.version.outputs.tag }}
-          DIST: ${{ steps.tag.outputs.dist_tag }}
+          NEW: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          DIST: ${{ needs.prepare.outputs.dist_tag }}
           DRY: ${{ inputs.dry-run }}
         run: |
           {

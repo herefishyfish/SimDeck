@@ -62,11 +62,14 @@ function resolveBinaryPath(rootDir) {
     return platformBinaryPath;
   }
 
-  for (const fallback of ["simdeck-bin.exe", "simdeck-bin"]) {
-    const fallbackBinaryPath = path.join(rootDir, "build", fallback);
-    if (existsSync(fallbackBinaryPath)) {
-      return fallbackBinaryPath;
-    }
+  // Only fall back to an unsuffixed binary that could actually run on this
+  // host. `simdeck-bin` is a macOS binary in a published tarball, so returning
+  // it on Windows made spawn fail with a bare ENOENT instead of the "native
+  // binary is missing" message above.
+  const fallback = platform === "win32" ? "simdeck-bin.exe" : "simdeck-bin";
+  const fallbackBinaryPath = path.join(rootDir, "build", fallback);
+  if (existsSync(fallbackBinaryPath)) {
+    return fallbackBinaryPath;
   }
   return platformBinaryPath;
 }
