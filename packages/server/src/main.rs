@@ -1787,11 +1787,8 @@ struct WorkspaceServiceProcess {
     metadata_path: PathBuf,
 }
 
+#[cfg(not(windows))]
 fn service_run_processes() -> anyhow::Result<Vec<ServiceRunProcess>> {
-    if cfg!(windows) {
-        // No `ps`; Windows services are tracked through their metadata files.
-        return Ok(Vec::new());
-    }
     let output = ProcessCommand::new("ps")
         .args(["-axo", "pgid=,command="])
         .output()
@@ -1806,6 +1803,37 @@ fn service_run_processes() -> anyhow::Result<Vec<ServiceRunProcess>> {
         .collect())
 }
 
+#[cfg(windows)]
+fn service_run_processes() -> anyhow::Result<Vec<ServiceRunProcess>> {
+    const SCRIPT: &str = r#"$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -like 'simdeck*.exe' -and $_.CommandLine -like '* service run *' -and $_.CommandLine -like '* --metadata-path *' } |
+  ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }"#;
+    let output = ProcessCommand::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .output()
+        .context("list Windows SimDeck service processes")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_windows_service_run_process_line)
+        .collect())
+}
+
+fn parse_windows_service_run_process_line(line: &str) -> Option<ServiceRunProcess> {
+    let (pid, command) = line.trim().split_once('\t')?;
+    if !command.contains(" service run ") || !command.contains(" --metadata-path ") {
+        return None;
+    }
+    Some(ServiceRunProcess {
+        pgid: pid.parse().ok()?,
+        metadata_path: PathBuf::from(command_arg_after(command, "--metadata-path")?),
+    })
+}
+
+#[cfg(not(windows))]
 fn parse_service_run_process_line(line: &str) -> Option<ServiceRunProcess> {
     let (pgid, command) = take_ps_field(line)?;
     if !command.contains(" service run ") || !command.contains(" --metadata-path ") {
@@ -1872,6 +1900,10 @@ fn workspace_service_process_is_current(
 }
 
 fn workspace_service_processes() -> anyhow::Result<Vec<WorkspaceServiceProcess>> {
+    if cfg!(windows) {
+        // Windows workspace services are tracked through their metadata files.
+        return Ok(Vec::new());
+    }
     let output = ProcessCommand::new("ps")
         .args(["-axo", "pid=,ppid=,pgid=,command="])
         .output()
@@ -2554,10 +2586,14 @@ fn read_service_metadata() -> anyhow::Result<Option<ServiceMetadata>> {
 
 fn write_service_metadata(metadata: &ServiceMetadata) -> anyhow::Result<()> {
     let path = service_metadata_path()?;
+    write_service_metadata_to_path(&path, metadata)
+}
+
+fn write_service_metadata_to_path(path: &Path, metadata: &ServiceMetadata) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, serde_json::to_vec_pretty(metadata)?)
+    fs::write(path, serde_json::to_vec_pretty(metadata)?)
         .with_context(|| format!("write {}", path.display()))
 }
 
@@ -4083,31 +4119,31 @@ fn main() -> anyhow::Result<()> {
                 let pairing_code = pairing_code.or_else(|| Some(auth::generate_pairing_code()));
                 let project_root = project_root()?;
                 if let Some(path) = metadata_path.as_ref() {
-                    write_service_metadata(&ServiceMetadata {
-                        project_root,
-                        pid: supervised_service_metadata_pid().unwrap_or_else(std::process::id),
-                        http_url: format!("http://127.0.0.1:{port}"),
-                        port,
-                        bind,
-                        advertise_host: advertise_host.clone(),
-                        client_root: client_root.clone(),
-                        access_token: access_token.clone(),
-                        pairing_code: pairing_code.clone(),
-                        binary_path: current_simdeck_executable_path()?,
-                        started_at: now_secs(),
-                        log_path: service_log_path().ok(),
-                        video_codec: Some(video_codec.as_env_value().to_owned()),
-                        android_gpu: Some(android_gpu.as_emulator_value().to_owned()),
-                        low_latency,
-                        realtime_stream: crate::transport::webrtc::realtime_stream_enabled()
-                            || low_latency
-                            || stream_quality_profile.is_some(),
-                        stream_quality_profile: stream_quality_profile.clone(),
-                        local_stream_fps,
-                    })?;
-                    if path != &service_metadata_path()? {
-                        let _ = fs::copy(service_metadata_path()?, path);
-                    }
+                    write_service_metadata_to_path(
+                        path,
+                        &ServiceMetadata {
+                            project_root,
+                            pid: supervised_service_metadata_pid().unwrap_or_else(std::process::id),
+                            http_url: format!("http://127.0.0.1:{port}"),
+                            port,
+                            bind,
+                            advertise_host: advertise_host.clone(),
+                            client_root: client_root.clone(),
+                            access_token: access_token.clone(),
+                            pairing_code: pairing_code.clone(),
+                            binary_path: current_simdeck_executable_path()?,
+                            started_at: now_secs(),
+                            log_path: service_log_path().ok(),
+                            video_codec: Some(video_codec.as_env_value().to_owned()),
+                            android_gpu: Some(android_gpu.as_emulator_value().to_owned()),
+                            low_latency,
+                            realtime_stream: crate::transport::webrtc::realtime_stream_enabled()
+                                || low_latency
+                                || stream_quality_profile.is_some(),
+                            stream_quality_profile: stream_quality_profile.clone(),
+                            local_stream_fps,
+                        },
+                    )?;
                 }
                 serve_with_appkit(
                     port,
@@ -6512,18 +6548,19 @@ mod tests {
         normalize_accessibility_point_for_display, parse_maestro_flow_yaml, parse_maestro_point,
         parse_optional_udid_f64_args, parse_optional_udid_text_args,
         parse_optional_udid_value_args, parse_tap_command_args,
-        parse_workspace_service_process_line, project_service_credentials_for_start_at_path,
-        project_service_credentials_from_metadata, read_project_service_credentials_from_path,
-        removed_service_process_name, render_agent_accessibility_tree, render_qr_code,
-        run_maestro_command, server_health_watchdog_should_restart, service_addresses,
-        service_matches_launch_options, service_post_error_is_retryable, service_url_is_healthy,
-        simdeck_open_link, simdeck_pair_url, studio_service_restart_args,
-        workspace_service_process_is_current, write_project_service_credentials_to_path,
-        AndroidGpuMode, Cli, Command, ElementSelector, NoCommandAction, PairingAddress,
-        ProjectServiceCredentials, ServiceCommand, ServiceLaunchOptions, ServiceMetadata,
-        StreamQualityProfileArg, StudioExposeOptions, TapCommandTarget, VideoCodecMode,
-        WorkspaceServiceProcess, YamlValue, DEFAULT_LOCAL_STREAM_QUALITY_PROFILE,
-        SERVER_HEALTH_WATCHDOG_FAILURE_THRESHOLD, SERVER_HEALTH_WATCHDOG_HTTP_FAILURE_THRESHOLD,
+        parse_windows_service_run_process_line, parse_workspace_service_process_line,
+        project_service_credentials_for_start_at_path, project_service_credentials_from_metadata,
+        read_project_service_credentials_from_path, removed_service_process_name,
+        render_agent_accessibility_tree, render_qr_code, run_maestro_command,
+        server_health_watchdog_should_restart, service_addresses, service_matches_launch_options,
+        service_post_error_is_retryable, service_url_is_healthy, simdeck_open_link,
+        simdeck_pair_url, studio_service_restart_args, workspace_service_process_is_current,
+        workspace_service_processes, write_project_service_credentials_to_path, AndroidGpuMode,
+        Cli, Command, ElementSelector, NoCommandAction, PairingAddress, ProjectServiceCredentials,
+        ServiceCommand, ServiceLaunchOptions, ServiceMetadata, StreamQualityProfileArg,
+        StudioExposeOptions, TapCommandTarget, VideoCodecMode, WorkspaceServiceProcess, YamlValue,
+        DEFAULT_LOCAL_STREAM_QUALITY_PROFILE, SERVER_HEALTH_WATCHDOG_FAILURE_THRESHOLD,
+        SERVER_HEALTH_WATCHDOG_HTTP_FAILURE_THRESHOLD,
     };
     use clap::Parser;
     use std::collections::HashMap;
@@ -6910,6 +6947,26 @@ mod tests {
             process.metadata_path,
             PathBuf::from("/tmp/simdeck/flutter.json")
         );
+    }
+
+    #[test]
+    fn windows_service_process_parser_reads_metadata_path() {
+        let process = parse_windows_service_run_process_line(
+            "8248\t\"D:\\Code\\SimDeck\\simdeck-bin.exe\" service run --metadata-path C:\\Users\\Dylan\\.simdeck\\service.json --port 4310",
+        )
+        .expect("parse Windows service");
+
+        assert_eq!(process.pgid, 8248);
+        assert_eq!(
+            process.metadata_path,
+            PathBuf::from(r"C:\Users\Dylan\.simdeck\service.json")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_service_processes_do_not_require_unix_ps_on_windows() {
+        assert!(workspace_service_processes().unwrap().is_empty());
     }
 
     #[test]

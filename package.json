@@ -53,7 +53,7 @@
   },
   "scripts": {
     "build:cli": "node scripts/build-cli.mjs",
-    "build:client": "scripts/build-client.sh",
+    "build:client": "node scripts/build-client.mjs",
     "build:app": "npm run build:cli && npm run build:client",
     "build:inspectors": "npm run build:nativescript-inspector && npm run build:react-native-inspector",
     "build:nativescript-inspector": "npm run --prefix packages/nativescript-inspector build",

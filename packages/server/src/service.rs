@@ -225,6 +225,9 @@ pub fn disable() -> anyhow::Result<()> {
 }
 
 pub fn kill_installed() -> anyhow::Result<Vec<u32>> {
+    if !launch_agent_supported() {
+        return Ok(Vec::new());
+    }
     ensure_launch_agent_supported()?;
     let domain = launchctl_domain()?;
     let killed = unload_existing_services(&domain)?;
@@ -950,5 +953,11 @@ mod tests {
     fn service_shutdown_grace_period_stays_short() {
         assert!(SERVICE_SHUTDOWN_GRACE <= Duration::from_secs(1));
         assert!(SERVICE_KILL_GRACE <= Duration::from_secs(1));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn kill_installed_is_a_noop_without_launch_agents() {
+        assert!(kill_installed().unwrap().is_empty());
     }
 }

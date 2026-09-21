@@ -41,7 +41,10 @@ function findPackageRoot(startDir) {
 
   while (true) {
     if (
-      existsSync(path.join(current, "package.json")) ||
+      (existsSync(path.join(current, "package.json")) &&
+        existsSync(
+          path.join(current, "packages", "cli", "bin", "simdeck.mjs"),
+        )) ||
       buildMarkers.some((marker) =>
         existsSync(path.join(current, "build", marker)),
       )
